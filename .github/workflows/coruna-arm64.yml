@@ -89,10 +89,16 @@ jobs:
       - name: 构建 jsc（JSCOnly + 静态链接，Linux 不需要 install_name_tool/codesign）
         run: |
           cd webkit
-          # 16GB 内存，-j4 安全；JSCOnly 只编 JS 引擎，不碰 WebCore/WebKit
+          # 说明：
+          #  - ENABLE_WERROR=OFF：runner 上的 GCC 比 WebKit-7617(2023-11) 当年的新，
+          #    新增警告会被 -Werror 升级成 error（实测炸在 testmasm.cpp 的
+          #    -Werror=type-limits / -Werror=parentheses）。
+          #  - 兜底：即使整包构建失败，也用 ninja 只构建 jsc 目标 —— testmasm 不是 jsc 的依赖。
           Tools/Scripts/build-jsc --jsc-only --release \
             --makeargs=-j4 \
-            --cmakeargs="-DENABLE_STATIC_JSC=ON"
+            --cmakeargs="-DENABLE_STATIC_JSC=ON -DENABLE_WERROR=OFF" \
+          || ( echo '=== full build failed, fallback: build jsc target only ===' ; \
+               ninja -C WebKitBuild/JSCOnly/Release -j4 jsc )
           find WebKitBuild -name jsc -type f -exec ls -lh {} \;
 
       - name: 冒烟测试
