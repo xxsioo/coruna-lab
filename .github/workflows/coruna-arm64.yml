@@ -73,6 +73,9 @@ jobs:
           git clone --depth 1 https://github.com/califio/publications.git califio
           ls -l califio/MADBugs/coruna/poc/
           sha256sum califio/MADBugs/coruna/poc/cve-2024-23222-rw.js | tee poc.sha256
+          # 绝对路径写进 GITHUB_ENV，后续步骤不依赖 cwd
+          echo "POC=$(realpath califio/MADBugs/coruna/poc/cve-2024-23222-rw.js)" | tee -a "$GITHUB_ENV"
+          echo "POCDIR=$(realpath califio/MADBugs/coruna/poc)" | tee -a "$GITHUB_ENV"
 
       - name: Clone WebKit（必须全历史）
         run: |
@@ -114,18 +117,22 @@ jobs:
       - name: 冒烟测试
         run: |
           cd webkit
-          JSC=$(find WebKitBuild -name jsc -type f | head -1)
+          JSC="$(realpath "$(find WebKitBuild -name jsc -type f | head -1)")"
           echo "JSC=$JSC" | tee -a "$GITHUB_ENV"
           "$JSC" -e 'print("jsc alive on " + (0xdeadbeef).toString(16))'
 
       - name: 先证 tgcp 可达
         run: |
-          "$JSC" califio/MADBugs/coruna/poc/cve-2024-23222-tgcp-reach.js 2>&1 | tail -40 || true
+          echo "JSC=$JSC"
+          echo "POC=$POC"
+          test -x "$JSC" || { echo "::error::jsc 不存在或不可执行: $JSC"; exit 1; }
+          "$JSC" "$POCDIR/cve-2024-23222-tgcp-reach.js" 2>&1 | tail -40 || true
 
       - name: 扫 PIVOT 平台期
         if: env.PIVOT_MODE == 'auto'
         run: |
-          POC=califio/MADBugs/coruna/poc/cve-2024-23222-rw.js
+          echo "JSC=$JSC  POC=$POC"
+          test -x "$JSC" || { echo "::error::jsc 不存在: $JSC"; exit 1; }
           echo "warmup=${WARMUP} gc_flush=${GC_FLUSH}"
           BEST=0; BEST_HITS=0
           for p in $(seq 165000 3000 195000); do
@@ -148,8 +155,8 @@ jobs:
 
       - name: 打到命中（竞态一进程一次，必须重起进程）
         run: |
-          POC=califio/MADBugs/coruna/poc/cve-2024-23222-rw.js
-          echo "FINAL_PIVOT=${FINAL_PIVOT}"
+          echo "JSC=$JSC  POC=$POC  FINAL_PIVOT=${FINAL_PIVOT}"
+          test -x "$JSC" || { echo "::error::jsc 不存在: $JSC"; exit 1; }
           n=0; MAX=80
           while [ "$n" -lt "$MAX" ]; do
             n=$((n+1))
