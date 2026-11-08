@@ -86,19 +86,29 @@ jobs:
           fi
           echo "OK: 未修补"
 
-      - name: 构建 jsc（JSCOnly + 静态链接，Linux 不需要 install_name_tool/codesign）
+      - name: 配置 CMake（JSCOnly port）
         run: |
           cd webkit
-          # 说明：
-          #  - ENABLE_WERROR=OFF：runner 上的 GCC 比 WebKit-7617(2023-11) 当年的新，
-          #    新增警告会被 -Werror 升级成 error（实测炸在 testmasm.cpp 的
-          #    -Werror=type-limits / -Werror=parentheses）。
-          #  - 兜底：即使整包构建失败，也用 ninja 只构建 jsc 目标 —— testmasm 不是 jsc 的依赖。
-          Tools/Scripts/build-jsc --jsc-only --release \
-            --makeargs=-j4 \
-            --cmakeargs="-DENABLE_STATIC_JSC=ON -DENABLE_WERROR=OFF" \
-          || ( echo '=== full build failed, fallback: build jsc target only ===' ; \
-               ninja -C WebKitBuild/JSCOnly/Release -j4 jsc )
+          # 复刻 build-jsc --jsc-only --release 实际发出的 cmake 命令（从日志逐字抄的），
+          # 但接下来只构建 jsc 目标，绕开 testmasm/testb3/testair/testapi/testdfg
+          cmake -DPORT=JSCOnly \
+                -DCMAKE_BUILD_TYPE=Release \
+                -G Ninja \
+                -DSHOW_BINDINGS_GENERATION_PROGRESS=1 \
+                -DDEVELOPER_MODE=ON \
+                -DENABLE_STATIC_JSC=ON \
+                -DENABLE_WERROR=OFF \
+                -DENABLE_FTL_JIT=ON \
+                -S . -B WebKitBuild/Release
+
+      - name: 构建 jsc（只建 jsc 目标）
+        run: |
+          cd webkit
+          # 关键：build-jsc 默认会一起构建 jsc testb3 testair testapi testmasm testdfg，
+          # 其中 testmasm.cpp 在新版 GCC 下触发 -Werror=type-limits / -Werror=parentheses，
+          # 而 jsc 并不依赖这些测试工具。这里只显式构建 jsc。
+          cmake --build WebKitBuild/Release --config Release -- jsc -j4
+          echo "=== 产物 ==="
           find WebKitBuild -name jsc -type f -exec ls -lh {} \;
 
       - name: 冒烟测试
